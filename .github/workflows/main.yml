@@ -96,6 +96,8 @@ jobs:
           cat ~/.config/copilot/mcp-config.json
       
       - name: Install GitHub Copilot CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: gh extension install github/gh-copilot
 
       - name: Configure GitHub CLI and Copilot
