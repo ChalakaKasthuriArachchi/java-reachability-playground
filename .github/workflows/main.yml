@@ -95,6 +95,9 @@ jobs:
           echo "MCP configuration created at ~/.config/copilot/mcp-config.json"
           cat ~/.config/copilot/mcp-config.json
       
+      - name: Install GitHub Copilot CLI
+        run: gh extension install github/gh-copilot
+
       - name: Configure GitHub CLI and Copilot
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
