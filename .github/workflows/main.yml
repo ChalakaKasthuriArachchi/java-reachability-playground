@@ -100,12 +100,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh extension install github/gh-copilot
 
-      - name: Configure GitHub CLI and Copilot
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # GitHub CLI is automatically authenticated via GH_TOKEN
-          gh copilot config set editor vscode
+      # Note: gh copilot config is skipped as it requires interactive prompts
+      # The gh copilot commands will work without explicit configuration in CI
       
       - name: Run Security Scan with Copilot + Snyk MCP
         id: security_scan
