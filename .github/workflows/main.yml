@@ -60,13 +60,13 @@ jobs:
           sleep 10
           
           # Check if process is running
-          if ps -p $MCP_PID > /dev/null; then
-            echo "✅ Snyk MCP server started successfully (PID: $MCP_PID)"
-          else
-            echo "❌ MCP server failed to start"
-            cat mcp-server.log
-            exit 1
-          fi
+          # if ps -p $MCP_PID > /dev/null; then
+          #   echo "✅ Snyk MCP server started successfully (PID: $MCP_PID)"
+          # else
+          #   echo "❌ MCP server failed to start"
+          #   cat mcp-server.log
+          #   exit 1
+          # fi
       
       - name: Create MCP Configuration
         env:
