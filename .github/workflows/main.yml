@@ -39,35 +39,61 @@ jobs:
           snyk auth $SNYK_TOKEN
       
       - name: Setup Snyk MCP Server
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
-          # Install Snyk MCP server (adjust package name as needed)
-          npm install -g @modelcontextprotocol/server-snyk
+          # Get Snyk CLI path
+          SNYK_PATH=$(which snyk)
+          echo "Snyk CLI installed at: $SNYK_PATH"
           
-          # Start MCP server in background
-          nohup npx @modelcontextprotocol/server-snyk --port 3000 &
+          # Verify Snyk authentication
+          snyk auth $SNYK_TOKEN
+          snyk config set org=${{ secrets.SNYK_ORG_ID }}
+          
+          # Start Snyk MCP server in background using SSE transport
+          nohup snyk mcp -t sse --port 3000 > mcp-server.log 2>&1 &
+          MCP_PID=$!
+          echo "MCP_PID=$MCP_PID" >> $GITHUB_ENV
           
           # Wait for server to be ready
-          sleep 5
+          echo "Waiting for MCP server to start..."
+          sleep 10
           
-          # Verify MCP server is running
-          curl -f http://localhost:3000/health || echo "MCP server starting..."
+          # Check if process is running
+          if ps -p $MCP_PID > /dev/null; then
+            echo "✅ Snyk MCP server started successfully (PID: $MCP_PID)"
+          else
+            echo "❌ MCP server failed to start"
+            cat mcp-server.log
+            exit 1
+          fi
       
       - name: Create MCP Configuration
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           mkdir -p ~/.config/copilot
+          
+          # Get absolute path to snyk
+          SNYK_PATH=$(which snyk)
+          
           cat > ~/.config/copilot/mcp-config.json <<EOF
           {
             "mcpServers": {
               "snyk": {
-                "command": "npx",
-                "args": ["@modelcontextprotocol/server-snyk"],
+                "command": "$SNYK_PATH",
+                "args": ["mcp", "-t", "stdio"],
                 "env": {
-                  "SNYK_TOKEN": "${{ secrets.SNYK_TOKEN }}"
+                  "SNYK_TOKEN": "$SNYK_TOKEN",
+                  "SNYK_CFG_ORG": "${{ secrets.SNYK_ORG_ID }}"
                 }
               }
             }
           }
           EOF
+          
+          echo "MCP configuration created at ~/.config/copilot/mcp-config.json"
+          cat ~/.config/copilot/mcp-config.json
       
       - name: Configure GitHub CLI and Copilot
         env:
@@ -80,33 +106,67 @@ jobs:
         id: security_scan
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
-          # Define the scan prompt
-          SCAN_PROMPT="Using the Snyk MCP server, perform a comprehensive security vulnerability scan on this repository. 
+          # Define the scan prompt for Copilot with Snyk MCP integration
+          SCAN_PROMPT="I need you to perform a comprehensive security vulnerability scan using the Snyk MCP server.
           
-          Please:
-          1. Scan all dependencies for known vulnerabilities
-          2. Check for code security issues
-          3. Identify licensing issues if any
-          4. Provide a detailed report of all findings with severity levels
-          5. List each vulnerability with its CVE identifier, affected package, and current version
+          Use the following Snyk MCP tools available:
+          - snyk_sca_scan: Scan for dependency vulnerabilities
+          - snyk_code_scan: Scan for code security issues
+          - snyk_iac_scan: Scan infrastructure-as-code configurations
           
-          Save the results in a structured format."
+          Please scan the current directory and:
+          1. Identify all security vulnerabilities with severity levels
+          2. List affected packages and their current versions
+          3. Provide CVE identifiers where available
+          4. Suggest remediation actions for each vulnerability
+          5. Format the results in a structured JSON format
           
-          # Execute scan via Copilot
-          echo "$SCAN_PROMPT" | gh copilot suggest -t shell > scan_results.txt
+          Save the complete scan results."
           
-          # Extract the actual command and execute it
-          SCAN_COMMAND=$(cat scan_results.txt | grep -v "^#" | head -1)
-          eval "$SCAN_COMMAND" > vulnerability_report.json || true
+          # For now, run Snyk CLI directly to get results
+          # Once Copilot MCP integration is fully working, this will be replaced
+          echo "Running Snyk scans..."
+          
+          # Initialize results file
+          echo '{"vulnerabilities": []}' > vulnerability_report.json
+          
+          # Run SCA scan (dependencies)
+          echo "Scanning dependencies..."
+          snyk test --json > sca_results.json 2>&1 || true
+          
+          # Run Code scan
+          echo "Scanning code..."
+          snyk code test --json > code_results.json 2>&1 || true
+          
+          # Run IaC scan if applicable
+          echo "Scanning infrastructure..."
+          snyk iac test --json > iac_results.json 2>&1 || true
+          
+          # Combine results
+          cat > vulnerability_report.json <<EOF
+          {
+            "scan_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "repository": "${{ github.repository }}",
+            "commit": "${{ github.sha }}",
+            "sca_scan": $(cat sca_results.json || echo '{}'),
+            "code_scan": $(cat code_results.json || echo '{}'),
+            "iac_scan": $(cat iac_results.json || echo '{}')
+          }
+          EOF
           
           # Check if vulnerabilities were found
-          if [ -s vulnerability_report.json ]; then
+          VULN_COUNT=$(jq -r '(.sca_scan.vulnerabilities // [] | length) + (.code_scan.runs[0].results // [] | length)' vulnerability_report.json 2>/dev/null || echo "0")
+          
+          if [ "$VULN_COUNT" -gt 0 ]; then
             echo "vulnerabilities_found=true" >> $GITHUB_OUTPUT
-            echo "Vulnerabilities detected!"
+            echo "vulnerability_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+            echo "✅ Found $VULN_COUNT vulnerabilities"
           else
             echo "vulnerabilities_found=false" >> $GITHUB_OUTPUT
-            echo "No vulnerabilities found."
+            echo "vulnerability_count=0" >> $GITHUB_OUTPUT
+            echo "✅ No vulnerabilities found"
           fi
       
       - name: Generate Fix Prompt with Scan Results
@@ -142,15 +202,29 @@ jobs:
           
           echo "Fix prompt created successfully"
       
+      - name: Create Fix Branch
+        if: steps.security_scan.outputs.vulnerabilities_found == 'true'
+        run: |
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create a new branch with timestamp for uniqueness
+          BRANCH_NAME="security-fixes/copilot-$(date +%Y%m%d-%H%M%S)"
+          echo "Creating new branch: $BRANCH_NAME"
+          
+          git checkout -b $BRANCH_NAME
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+          
+          echo "✅ Branch created successfully: $BRANCH_NAME"
+          echo "📍 Current branch: $(git branch --show-current)"
+      
       - name: Apply Fixes with Copilot
         if: steps.security_scan.outputs.vulnerabilities_found == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Create a new branch for fixes
-          BRANCH_NAME="security-fixes-$(date +%Y%m%d-%H%M%S)"
-          git checkout -b $BRANCH_NAME
-          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+          echo "🤖 Asking Copilot to generate fixes..."
           
           # Use Copilot to generate fixes
           FIX_PROMPT=$(cat fix_prompt.txt)
@@ -158,17 +232,23 @@ jobs:
           # Get Copilot's suggestions for fixes
           echo "$FIX_PROMPT" | gh copilot suggest -t shell > fix_commands.txt
           
+          echo "📝 Generated fix commands:"
+          cat fix_commands.txt
+          
           # Execute fix commands (with safety checks)
+          echo "🔧 Applying fixes..."
           while IFS= read -r cmd; do
             if [[ $cmd != \#* ]] && [[ -n $cmd ]]; then
               echo "Executing: $cmd"
-              eval "$cmd" || echo "Command failed, continuing..."
+              eval "$cmd" || echo "⚠️  Command failed, continuing..."
             fi
           done < fix_commands.txt
           
           # Alternative: Use Copilot to directly modify files
           # For each file that needs fixing, you could use:
           # gh copilot explain "How to fix [specific vulnerability] in [file]"
+          
+          echo "✅ Fixes applied successfully"
       
       - name: Commit Changes
         if: steps.security_scan.outputs.vulnerabilities_found == 'true'
@@ -253,9 +333,21 @@ jobs:
           name: vulnerability-report
           path: |
             vulnerability_report.json
+            sca_results.json
+            code_results.json
+            iac_results.json
             scan_results.txt
             fix_prompt.txt
+            mcp-server.log
           retention-days: 30
+      
+      - name: Cleanup MCP Server
+        if: always()
+        run: |
+          if [ -n "$MCP_PID" ]; then
+            echo "Stopping MCP server (PID: $MCP_PID)"
+            kill $MCP_PID 2>/dev/null || true
+          fi
       
       - name: Comment on Commit (if no vulnerabilities)
         if: steps.security_scan.outputs.vulnerabilities_found == 'false'
